@@ -2,6 +2,8 @@ import SwiftUI
 import PhotosUI
 import UniformTypeIdentifiers
 import UIKit
+import AudioToolbox
+import UserNotifications
 
 struct KitchenHubView: View {
     @ObservedObject var store: RecipeStore
@@ -41,6 +43,7 @@ struct KitchenHubView: View {
 private struct ShoppingListView: View {
     @ObservedObject var store: RecipeStore
     @State private var choosingRecipes = false
+    @State private var showsConvertedAmounts = false
 
     var body: some View {
         List {
@@ -50,6 +53,8 @@ private struct ShoppingListView: View {
                 }
                 Text("選択中：\(store.professionalData.shoppingRecipeIDs.count)件")
                     .foregroundStyle(.secondary)
+                Toggle("個数・重さ・計量単位の目安に切り替える", isOn: $showsConvertedAmounts)
+                    .tint(.orange)
             }
 
             Section("合算した買い物リスト") {
@@ -69,7 +74,7 @@ private struct ShoppingListView: View {
                                     .font(.caption).foregroundStyle(.secondary)
                             }
                             Spacer()
-                            Text("\(item.amount.recipeAmount) \(item.unit)").fontWeight(.semibold)
+                            shoppingAmount(for: item)
                         }
                     }
                     .buttonStyle(.plain)
@@ -95,6 +100,33 @@ private struct ShoppingListView: View {
                 }
                 .navigationTitle("レシピを選択")
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完了") { choosingRecipes = false } } }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func shoppingAmount(for item: ShoppingItem) -> some View {
+        let original = "\(item.amount.recipeAmount) \(localizedIngredientUnit(item.unit))"
+        let ingredient = Ingredient(name: item.name, amount: item.amount, unit: item.unit)
+        let converted = IngredientConversion.estimate(for: ingredient, amount: item.amount)
+
+        if showsConvertedAmounts, let converted {
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(converted)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(.orange)
+                Text("元：\(original)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        } else {
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(original).fontWeight(.semibold)
+                if converted != nil {
+                    Text("換算できます")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
     }
@@ -136,6 +168,7 @@ private struct KitchenTimer: Identifiable {
     var name: String
     var seconds: Int
     var endDate: Date?
+    var didPlayCompletionSound = false
 }
 
 struct MultiTimerView: View {
@@ -145,35 +178,159 @@ struct MultiTimerView: View {
 
     var body: some View {
         List {
-            Section("タイマーを追加") {
+            Section("新しいタイマー") {
                 TextField("工程名（例：生地を休ませる）", text: $name)
+
                 Stepper("\(minutes)分", value: $minutes, in: 1...360)
-                Button("タイマーを追加", systemImage: "plus.circle") {
-                    timers.append(KitchenTimer(name: name.isEmpty ? "タイマー" : name, seconds: minutes * 60))
-                    name = ""
+
+                HStack(spacing: 8) {
+                    ForEach([1, 3, 5, 10], id: \.self) { preset in
+                        Button("\(preset)分") {
+                            minutes = preset
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(minutes == preset ? .orange : .secondary)
+                    }
                 }
+
+                Button {
+                    let seconds = minutes * 60
+                    let newTimer = KitchenTimer(
+                        name: name.isEmpty ? "タイマー" : name,
+                        seconds: seconds,
+                        endDate: Date().addingTimeInterval(TimeInterval(seconds))
+                    )
+                    timers.append(newTimer)
+                    scheduleCompletionNotification(for: newTimer, after: seconds)
+                    name = ""
+                } label: {
+                    Text("スタート")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.orange)
+                .controlSize(.large)
             }
-            Section("同時タイマー") {
+
+            Section("使用中のタイマー") {
+                if timers.isEmpty {
+                    Text("時間を選んで「スタート」を押すと、すぐにカウントが始まります。")
+                        .foregroundStyle(.secondary)
+                }
+
                 ForEach($timers) { $timer in
                     TimelineView(.periodic(from: .now, by: 1)) { context in
                         let remaining = max(0, timer.endDate.map { Int($0.timeIntervalSince(context.date)) } ?? timer.seconds)
-                        HStack {
-                            VStack(alignment: .leading) {
-                                Text(timer.name).font(.headline)
-                                Text(String(format: "%02d:%02d", remaining / 60, remaining % 60))
-                                    .font(.title3.monospacedDigit())
-                                    .foregroundStyle(remaining == 0 && timer.endDate != nil ? .red : .orange)
+
+                        VStack(alignment: .leading, spacing: 12) {
+                            HStack(alignment: .firstTextBaseline) {
+                                Text(timer.name)
+                                    .font(.headline)
+                                Spacer()
+                                Text(remaining == 0 && timer.endDate != nil ? "時間です" : timer.endDate == nil ? "停止中" : "計測中")
+                                    .font(.caption)
+                                    .foregroundStyle(remaining == 0 && timer.endDate != nil ? .red : .secondary)
                             }
-                            Spacer()
-                            Button(timer.endDate == nil ? "開始" : "再開") {
-                                timer.endDate = Date().addingTimeInterval(TimeInterval(max(remaining, timer.seconds)))
-                            }.buttonStyle(.borderedProminent).tint(.orange)
+
+                            Text(String(format: "%02d:%02d", remaining / 60, remaining % 60))
+                                .font(.system(size: 38, weight: .semibold, design: .rounded).monospacedDigit())
+                                .foregroundStyle(remaining == 0 && timer.endDate != nil ? .red : .orange)
+                                .frame(maxWidth: .infinity, alignment: .center)
+
+                            HStack {
+                                if timer.endDate == nil {
+                                    Button {
+                                        timer.didPlayCompletionSound = false
+                                        timer.endDate = Date().addingTimeInterval(TimeInterval(timer.seconds))
+                                        scheduleCompletionNotification(for: timer, after: timer.seconds)
+                                    } label: {
+                                        Text("スタート")
+                                            .frame(maxWidth: .infinity, alignment: .center)
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .tint(.orange)
+                                } else if remaining > 0 {
+                                    Button {
+                                        timer.seconds = remaining
+                                        timer.endDate = nil
+                                        cancelCompletionNotification(for: timer)
+                                    } label: {
+                                        Label("停止", systemImage: "stop.fill")
+                                            .frame(maxWidth: .infinity)
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .tint(.red)
+                                } else {
+                                    Button {
+                                        timer.didPlayCompletionSound = false
+                                        timer.endDate = Date().addingTimeInterval(TimeInterval(timer.seconds))
+                                        scheduleCompletionNotification(for: timer, after: timer.seconds)
+                                    } label: {
+                                        Label("もう一度", systemImage: "arrow.counterclockwise")
+                                            .frame(maxWidth: .infinity)
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .tint(.orange)
+                                }
+
+                                Button(role: .destructive) {
+                                    cancelCompletionNotification(for: timer)
+                                    timers.removeAll { $0.id == timer.id }
+                                } label: {
+                                    Label("削除", systemImage: "trash")
+                                }
+                                .buttonStyle(.bordered)
+                            }
+                        }
+                        .padding(.vertical, 6)
+                        .onChange(of: remaining) { _, newValue in
+                            guard newValue == 0,
+                                  timer.endDate != nil,
+                                  !timer.didPlayCompletionSound else { return }
+
+                            timer.didPlayCompletionSound = true
+                            AudioServicesPlayAlertSound(SystemSoundID(1005))
+                            UINotificationFeedbackGenerator().notificationOccurred(.success)
                         }
                     }
                 }
-                .onDelete { timers.remove(atOffsets: $0) }
+                .onDelete { offsets in
+                    offsets.map { timers[$0] }.forEach(cancelCompletionNotification)
+                    timers.remove(atOffsets: offsets)
+                }
             }
         }
+    }
+
+    // タイマー画面を閉じていても、終了時間に通知音を鳴らします。
+    private func scheduleCompletionNotification(for timer: KitchenTimer, after seconds: Int) {
+        let notificationCenter = UNUserNotificationCenter.current()
+
+        notificationCenter.requestAuthorization(options: [.alert, .sound]) { allowed, _ in
+            guard allowed else { return }
+
+            let content = UNMutableNotificationContent()
+            content.title = "タイマーが終了しました"
+            content.body = timer.name
+            content.sound = .default
+
+            let trigger = UNTimeIntervalNotificationTrigger(
+                timeInterval: TimeInterval(max(1, seconds)),
+                repeats: false
+            )
+            let request = UNNotificationRequest(
+                identifier: timer.id.uuidString,
+                content: content,
+                trigger: trigger
+            )
+            notificationCenter.add(request)
+        }
+    }
+
+    private func cancelCompletionNotification(for timer: KitchenTimer) {
+        UNUserNotificationCenter.current()
+            .removePendingNotificationRequests(withIdentifiers: [timer.id.uuidString])
     }
 }
 

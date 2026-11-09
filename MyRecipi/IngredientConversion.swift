@@ -111,6 +111,17 @@ enum IngredientConversion {
             return estimateText(value: amount * multiplier, unit: "ml")
         }
 
+        // 買い物リストで合算されたmlを、計量しやすい単位へ戻す
+        if unit.lowercased() == "ml" || unit.lowercased() == "cc" {
+            if amount >= 100 {
+                return estimateText(value: amount / 200, unit: "カップ")
+            }
+            if amount >= 15 {
+                return estimateText(value: amount / 15, unit: "大さじ")
+            }
+            return estimateText(value: amount / 5, unit: "小さじ")
+        }
+
         // g・kg・mgから個数を出す
         if unit == "kg" {
             if let pieceEstimate = pieceEstimate(for: ingredient.name, grams: amount * 1_000) {

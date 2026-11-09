@@ -32,10 +32,20 @@ enum RecipeOCRService {
     private static let recipeWords = [
         "材料", "食材", "分量", "作り方", "調理工程", "手順", "下準備",
         "大さじ", "小さじ", "適量", "少々", "ひとつまみ", "人分",
+        "薄力粉", "中力粉", "強力粉", "全粒粉", "片栗粉", "コーンスターチ",
+        "上白糖", "グラニュー糖", "粉糖", "きび砂糖", "塩", "こしょう",
+        "無塩バター", "有塩バター", "牛乳", "生クリーム", "卵", "卵黄", "卵白",
+        "ベーキングパウダー", "ドライイースト", "ゼラチン", "バニラエッセンス",
+        "しょうゆ", "みりん", "料理酒", "味噌", "だし", "オリーブオイル",
         "Ingredients", "Instructions", "Préparation", "Ingrédients",
+        "farine", "farine faible", "sucre", "sucre glace", "beurre", "lait",
+        "crème", "œuf", "oeuf", "levure", "sel", "poivre", "poireau",
         "cuillère à soupe", "cuillère à café", "écumer", "émincer", "ciseler",
-        "concasser", "mijoter", "déglacer", "réduire", "tamiser", "incorporer"
+        "concasser", "mijoter", "déglacer", "réduire", "tamiser", "incorporer", "passer", "suer"
     ]
+
+    // OCRが似た文字を複数候補にしたとき、レシピらしい候補を選ぶために使う。
+    private static let amountAndUnitHint = #"[0-9]+(?:[\.,][0-9]+)?\s*(?:g|kg|mg|ml|mL|L|cc|大さじ|小さじ|個|本|枚|片|丁|袋|缶|%|適量|少々)"#
 
     static func makeDraft(from data: Data) async throws -> RecipeOCRDraft {
         try await Task.detached(priority: .userInitiated) {
@@ -103,7 +113,7 @@ enum RecipeOCRService {
         try handler.perform([request])
 
         let fragments = (request.results ?? []).compactMap { observation -> TextFragment? in
-            guard let candidate = observation.topCandidates(1).first else { return nil }
+            guard let candidate = preferredCandidate(in: observation) else { return nil }
             let text = candidate.string.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { return nil }
             return TextFragment(text: text, box: observation.boundingBox, confidence: candidate.confidence)
@@ -114,6 +124,25 @@ enum RecipeOCRService {
             ? 0
             : fragments.reduce(0) { $0 + $1.confidence } / Float(fragments.count)
         return OCRResult(lines: lines, confidence: confidence)
+    }
+
+    private static func preferredCandidate(in observation: VNRecognizedTextObservation) -> VNRecognizedText? {
+        observation.topCandidates(3).max { candidateScore($0) < candidateScore($1) }
+    }
+
+    private static func candidateScore(_ candidate: VNRecognizedText) -> Double {
+        let text = normalize(candidate.string)
+        var score = Double(candidate.confidence) * 100
+
+        if recipeWords.contains(where: {
+            $0.count >= 2 && text.localizedCaseInsensitiveContains($0)
+        }) {
+            score += 5
+        }
+        if text.range(of: amountAndUnitHint, options: [.regularExpression, .caseInsensitive]) != nil {
+            score += 4
+        }
+        return score
     }
 
     private static func mergeFragmentsOnSameLine(_ fragments: [TextFragment]) -> [String] {
@@ -179,6 +208,28 @@ enum RecipeOCRService {
             highContrast.setValue(exposure.outputImage, forKey: kCIInputImageKey)
             highContrast.setValue(1.75, forKey: kCIInputContrastKey)
             if let output = highContrast.outputImage,
+               let rendered = context.createCGImage(output, from: input.extent) {
+                results.append(rendered)
+            }
+        }
+
+        // 紙に影がある写真向け。暗い部分を持ち上げながら、文字の輪郭を残す。
+        if let shadows = CIFilter(name: "CIHighlightShadowAdjust"),
+           let shadowContrast = CIFilter(name: "CIColorControls"),
+           let unsharp = CIFilter(name: "CIUnsharpMask") {
+            shadows.setValue(input, forKey: kCIInputImageKey)
+            shadows.setValue(0.9, forKey: "inputShadowAmount")
+            shadows.setValue(0.75, forKey: "inputHighlightAmount")
+
+            shadowContrast.setValue(shadows.outputImage, forKey: kCIInputImageKey)
+            shadowContrast.setValue(0, forKey: kCIInputSaturationKey)
+            shadowContrast.setValue(1.55, forKey: kCIInputContrastKey)
+            shadowContrast.setValue(0.02, forKey: kCIInputBrightnessKey)
+
+            unsharp.setValue(shadowContrast.outputImage, forKey: kCIInputImageKey)
+            unsharp.setValue(0.7, forKey: kCIInputRadiusKey)
+            unsharp.setValue(0.8, forKey: kCIInputIntensityKey)
+            if let output = unsharp.outputImage,
                let rendered = context.createCGImage(output, from: input.extent) {
                 results.append(rendered)
             }
@@ -270,18 +321,18 @@ enum RecipeOCRService {
             return Ingredient(name: cleanIngredientName(parts[0]), amount: 1, unit: unit)
         }
         let quantity = #"((?:約|各)?\s*[0-9]+(?:[\.,][0-9]+)?(?:\s+[0-9]+/[0-9]+)?(?:\s*[〜~～\-]\s*[0-9]+(?:[\.,][0-9]+)?)?|(?:約|各)?\s*[0-9]+/[0-9]+)"#
-        let unit = #"(大さじ|小さじ|大匙|小匙|カップ|切れ|パック|cuillères? à soupe|cuillères? à café|tbsp|tsp|cups?|kg|mg|g|mL|ml|cl|dL|dl|L|l|cc|個分|個|本|枚|片|丁|玉|尾|袋|缶|束|株|房|合|%|℃|度)"#
+        let unit = #"(大さじ|小さじ|大匙|小匙|カップ|切れ|パック|cuillères? à soupe|cuillères? à café|tbsp|tsp|cups?|kg|mg|g|mL|ml|cl|dL|dl|L|l|cc|個分|個|本|枚|片|丁|玉|尾|袋|缶|束|株|房|合|%)"#
 
         let suffixPattern = "^(.+?)[\\s:：・]*\(quantity)\\s*\(unit)(?:\\s*[（(].*)?$"
         if let parts = captures(in: line, pattern: suffixPattern),
            let amount = parseAmount(parts[1]) {
-            return Ingredient(name: cleanIngredientName(parts[0]), amount: amount, unit: parts[2])
+            return Ingredient(name: cleanIngredientName(parts[0]), amount: amount, unit: canonicalUnit(parts[2]))
         }
 
         let prefixPattern = "^(.+?)[\\s:：・]+\(unit)\\s*\(quantity)(?:\\s*[（(].*)?$"
         if let parts = captures(in: line, pattern: prefixPattern),
            let amount = parseAmount(parts[2]) {
-            return Ingredient(name: cleanIngredientName(parts[0]), amount: amount, unit: parts[1])
+            return Ingredient(name: cleanIngredientName(parts[0]), amount: amount, unit: canonicalUnit(parts[1]))
         }
 
         let amountOnlyPattern = "^(.+?)[\\s:：・]+\(quantity)$"
@@ -332,6 +383,19 @@ enum RecipeOCRService {
     private static func cleanIngredientName(_ name: String) -> String {
         name.replacingOccurrences(of: #"[\.．…・:：\-]+$"#, with: "", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func canonicalUnit(_ unit: String) -> String {
+        let key = unit.lowercased().folding(options: .diacriticInsensitive, locale: Locale(identifier: "fr_FR"))
+        switch key {
+        case "大匙", "tbsp", "cuillere a soupe", "cuilleres a soupe": return "大さじ"
+        case "小匙", "tsp", "cuillere a cafe", "cuilleres a cafe": return "小さじ"
+        case "cup", "cups": return "カップ"
+        case "l": return "L"
+        case "ml": return "ml"
+        case "dl": return "dL"
+        default: return unit
+        }
     }
 
     private static func stitchIngredientRows(_ lines: [String]) -> [String] {

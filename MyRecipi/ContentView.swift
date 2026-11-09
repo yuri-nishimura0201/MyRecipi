@@ -29,5 +29,7 @@ struct ContentView: View {
                 .tabItem { Label("設定", systemImage: "gearshape") }
         }
         .tint(.orange)
+        // どの画面でも、入力欄の外を押すとキーボードを閉じます。
+        .background(KeyboardDismissController())
     }
 }

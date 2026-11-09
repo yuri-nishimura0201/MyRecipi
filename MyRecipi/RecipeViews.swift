@@ -18,6 +18,7 @@ struct RecipeLibraryView: View {
     @State private var showingEditor = false
     @State private var scanItems: [PhotosPickerItem] = []
     @State private var scannedRecipe: Recipe?
+    @State private var scannedSourcePhoto: UIImage?
     @State private var isScanning = false
     @State private var scanError = false
     @State private var showingCamera = false
@@ -117,7 +118,7 @@ struct RecipeLibraryView: View {
                 RecipeEditorView(store: store) { store.add($0) }
             }
             .sheet(item: $scannedRecipe) { draft in
-                RecipeEditorView(store: store, recipe: draft) { store.add($0) }
+                RecipeEditorView(store: store, recipe: draft, sourcePhoto: scannedSourcePhoto) { store.add($0) }
             }
             .fullScreenCover(isPresented: $showingCamera) {
                 CameraPicker { data in
@@ -174,6 +175,7 @@ struct RecipeLibraryView: View {
 
     private func applyScannedDraft(from pages: [Data]) async throws {
         let draft = try await RecipeOCRService.makeDraft(from: pages)
+        scannedSourcePhoto = pages.first.flatMap(UIImage.init(data:))
         scannedRecipe = Recipe(
             title: draft.title,
             category: "和食",
@@ -737,6 +739,32 @@ private enum VoiceInputTarget: Equatable {
     case step(Int)
 }
 
+// 写真読み取り後に、元の紙レシピを大きく確認する画面
+private struct SourceRecipePhotoView: View {
+    @Environment(\.dismiss) private var dismiss
+    let image: UIImage
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxWidth: .infinity)
+                    .padding()
+            }
+            .background(Color.black.opacity(0.94))
+            .navigationTitle("元のレシピ写真")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("閉じる") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
 // MARK: - 5. レシピ入力・編集画面
 
 struct RecipeEditorView: View {
@@ -744,6 +772,8 @@ struct RecipeEditorView: View {
     @ObservedObject var store: RecipeStore
     @State private var recipe: Recipe
     @State private var selectedPhoto: PhotosPickerItem?
+    @State private var sourcePhotoPreview: UIImage?
+    @State private var showingSourcePhoto = false
     @State private var selectedFinishedPhoto: PhotosPickerItem?
     @State private var finishedPhotoData: Data?
     @State private var finishedPhotoPreview: UIImage?
@@ -757,9 +787,15 @@ struct RecipeEditorView: View {
     @FocusState private var focusedStepIndex: Int?
     let onSave: (Recipe) -> Void
 
-    init(store: RecipeStore, recipe: Recipe? = nil, onSave: @escaping (Recipe) -> Void) {
+    init(
+        store: RecipeStore,
+        recipe: Recipe? = nil,
+        sourcePhoto: UIImage? = nil,
+        onSave: @escaping (Recipe) -> Void
+    ) {
         self.store = store
         _recipe = State(initialValue: recipe ?? Recipe(title: "", category: "和食", servings: 2, cookingMinutes: 30, ingredients: [Ingredient(name: "", amount: 0, unit: "g")], steps: [""], notes: "", isFavorite: false))
+        _sourcePhotoPreview = State(initialValue: sourcePhoto)
         _finishedPhotoPreview = State(initialValue: recipe.flatMap { store.photoImage(for: $0) })
         self.onSave = onSave
     }
@@ -807,9 +843,35 @@ struct RecipeEditorView: View {
         NavigationStack {
             Form {
                 Section {
+                    if let sourcePhotoPreview {
+                        Button {
+                            dismissKeyboard()
+                            showingSourcePhoto = true
+                        } label: {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Image(uiImage: sourcePhotoPreview)
+                                    .resizable()
+                                    .scaledToFit()
+                                    .frame(maxWidth: .infinity, maxHeight: 260)
+                                    .clipShape(RoundedRectangle(cornerRadius: 14))
+
+                                Label("元の写真を拡大して確認", systemImage: "arrow.up.left.and.arrow.down.right")
+                                    .font(.footnote.weight(.semibold))
+                                    .foregroundStyle(.orange)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("読み取った元の写真を拡大して確認")
+                    }
+
                     PhotosPicker(selection: $selectedPhoto, matching: .images) {
                         HStack {
-                            Label(isReadingPhoto ? "写真を読み取り中…" : "紙のレシピを写真から読み取る", systemImage: "doc.viewfinder")
+                            Label(
+                                isReadingPhoto
+                                    ? "写真を読み取り中…"
+                                    : (sourcePhotoPreview == nil ? "紙のレシピを写真から読み取る" : "別の写真に変更して読み取る"),
+                                systemImage: "doc.viewfinder"
+                            )
                             Spacer()
                             if isReadingPhoto { ProgressView() }
                         }
@@ -820,7 +882,7 @@ struct RecipeEditorView: View {
                         Text(readingMessage).font(.footnote).foregroundStyle(.secondary)
                     }
                 } footer: {
-                    Text("写真内の文字から料理名・材料・工程の下書きを作ります。読み取り後に内容を確認してください。")
+                    Text("読み取り後も元の写真を上に表示します。写真と見比べながら、材料や工程の間違いを修正できます。元の写真はレシピ保存時には保存されません。")
                 }
 
                 Section("基本情報") {
@@ -1195,6 +1257,11 @@ struct RecipeEditorView: View {
                     cookingTermStepIndex = nil
                 }
             }
+            .sheet(isPresented: $showingSourcePhoto) {
+                if let sourcePhotoPreview {
+                    SourceRecipePhotoView(image: sourcePhotoPreview)
+                }
+            }
         }
     }
 
@@ -1234,11 +1301,18 @@ struct RecipeEditorView: View {
                 guard let data = try await item.loadTransferable(type: Data.self) else {
                     throw RecipeOCRError.imageUnavailable
                 }
+                guard let image = UIImage(data: data) else {
+                    throw RecipeOCRError.imageUnavailable
+                }
+                sourcePhotoPreview = image
                 let draft = try await RecipeOCRService.makeDraft(from: data)
                 if !draft.title.isEmpty { recipe.title = draft.title }
                 if !draft.ingredients.isEmpty { recipe.ingredients = draft.ingredients }
                 if !draft.steps.isEmpty { recipe.steps = draft.steps }
-                readingMessage = NSLocalizedString("読み取りました。内容を確認して保存してください。", comment: "")
+                let resultSummary = "材料\(draft.ingredients.count)件・工程\(draft.steps.count)件を読み取りました。"
+                readingMessage = draft.needsReview
+                    ? resultSummary + " 読みにくい文字があるため、上の元写真と見比べて確認してください。"
+                    : resultSummary + " 上の元写真と見比べて確認してください。"
             } catch {
                 readingMessage = NSLocalizedString("文字を読み取れませんでした。明るい場所で紙全体を撮影してお試しください。", comment: "")
             }
